@@ -1,0 +1,110 @@
+# Shared by backend and telemetry-worker. They MUST run the same image:
+# separate builds of the same Dockerfile drift silently, and a rebuilt API
+# running against a stale worker is a genuinely confusing failure to debug.
+x-backend: &backend
+  build: ./backend
+  image: kart-backend:latest
+  volumes:
+    - ./backend:/app
+    - telemetry_blobs:/data/telemetry/blobs
+    - telemetry_cache:/data/telemetry/cache
+  environment: &backend-env
+    DEBUG: 1
+    SECRET_KEY: dev-secret-key-change-in-production
+    # settings.py reads these individually, not DATABASE_URL
+    DB_NAME: kart_management
+    DB_USER: postgres
+    DB_PASSWORD: postgres
+    DB_HOST: db
+    DB_PORT: 5432
+    WEATHER_API_KEY: ""
+    TELEMETRY_REDIS_URL: redis://telemetry-redis:6379/0
+    TELEMETRY_LIBXRK_BACKEND: rust
+    TELEMETRY_ANTHROPIC_API_KEY: "${TELEMETRY_ANTHROPIC_API_KEY:-}"
+
+services:
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: kart_management
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      # 5432 on the host is already taken by another stack
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Pure job broker for telemetry ingest. Persistence is deliberately off:
+  # a lost queue is recoverable (re-enqueue), a corrupt AOF is not worth it.
+  telemetry-redis:
+    image: redis:7-alpine
+    command: redis-server --save "" --appendonly no
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  backend:
+    <<: *backend
+    # sh -c so the && chain actually runs in a shell.
+    # Deliberately NOT makemigrations: telemetry uses a custom field, partial
+    # unique constraints and expression indexes, and a boot-time makemigrations
+    # would write a mis-generated migration straight into the bind mount.
+    command: sh -c "python manage.py migrate && python manage.py runserver 0.0.0.0:8000"
+    ports:
+      # 8000 on the host is already taken; the frontend expects the API on 8001
+      - "8001:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      telemetry-redis:
+        condition: service_healthy
+
+  # Parsing is CPU-bound C that holds the GIL, so it runs out-of-process.
+  # RQ forks per job, which returns numpy/pyarrow memory to the OS and
+  # isolates a segfault or MemoryError from the API.
+  telemetry-worker:
+    <<: *backend
+    command: python manage.py telemetry_worker
+    depends_on:
+      db:
+        condition: service_healthy
+      telemetry-redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          # Measured peak RSS is ~100 MB for a 4.6 MB session; this is headroom
+          # for a pathological file, not a target. More workers than cores just
+          # thrashes, so replicas stays at 1.
+          memory: 2g
+
+  frontend:
+    build: ./frontend
+    command: pnpm dev --host 0.0.0.0 --port 3000
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    environment:
+      - VITE_API_URL=http://localhost:8001/api
+      # vite dev-server /api proxy target, from inside the container
+      - VITE_PROXY_TARGET=http://backend:8000
+      - CHOKIDAR_USEPOLLING=true
+    stdin_open: true
+    tty: true
+
+volumes:
+  postgres_data:
+  telemetry_blobs:
+  telemetry_cache:

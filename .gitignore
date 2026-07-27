@@ -1,0 +1,15 @@
+# The application repos are cloned in place, not vendored here.
+# See README.md for the clone commands. Deliberately plain clones rather
+# than submodules: the deploy workflow does `git pull origin main` inside
+# backend/, which submodule pinning would fight.
+/backend/
+/frontend/
+
+# Real environment files never belong in git -- see .env.example for the
+# key names each service expects.
+.env
+*.env
+!.env.example
+
+# Scratch space
+.telemetry-probe/

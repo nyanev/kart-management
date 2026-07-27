@@ -1,0 +1,99 @@
+services:
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: kart_management
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Job broker for telemetry ingest. Deliberately no persistence: a lost
+  # queue is recoverable by re-enqueueing, a corrupt AOF is not worth it.
+  telemetry-redis:
+    image: redis:7-alpine
+    command: redis-server --save "" --appendonly no
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  backend:
+    build: ./backend
+    # Pinned so backend and telemetry-worker provably run the same build.
+    # Without this, compose builds a separate image per service and a
+    # rebuilt API against a stale worker is a confusing failure to debug.
+    image: kart-backend:latest
+    command: >
+      sh -c "python manage.py migrate --noinput &&
+             gunicorn kart_management.wsgi:application --bind 0.0.0.0:8000 --workers 4"
+    ports:
+      - "127.0.0.1:8001:8000"
+    env_file:
+      - ./backend/.env
+    volumes:
+      # Telemetry storage. WITHOUT THESE, uploads are written into the
+      # container's writable layer -- the path exists in the image -- and are
+      # silently destroyed on the next `up --build`, leaving Postgres rows
+      # pointing at blobs that no longer exist.
+      #
+      # blobs = the original uploads, content-addressed. Source of truth.
+      #         BACK THIS UP; everything else rebuilds from it.
+      # cache = derived Arrow files. Disposable.
+      - telemetry_blobs:/data/telemetry/blobs
+      - telemetry_cache:/data/telemetry/cache
+    depends_on:
+      db:
+        condition: service_healthy
+      telemetry-redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Parsing runs out-of-process: libxrk is CPU-bound C holding the GIL, a
+  # fork returns numpy/pyarrow memory to the OS when the job ends, and a
+  # MemoryError or segfault kills one fork instead of the API.
+  telemetry-worker:
+    build: ./backend
+    image: kart-backend:latest
+    command: python manage.py telemetry_worker
+    env_file:
+      - ./backend/.env
+    volumes:
+      - telemetry_blobs:/data/telemetry/blobs
+      - telemetry_cache:/data/telemetry/cache
+    depends_on:
+      db:
+        condition: service_healthy
+      telemetry-redis:
+        condition: service_healthy
+    restart: unless-stopped
+    # Measured peak RSS is ~100 MB for a 4.6 MB session. This is headroom for
+    # a pathological file, and a ceiling so a runaway parse cannot starve the
+    # other stacks sharing this host. One replica: parsing is CPU-bound, so
+    # more workers than cores just thrashes.
+    mem_limit: 768m
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.prod
+      args:
+        VITE_API_URL: ${VITE_API_URL}
+    ports:
+      - "127.0.0.1:3002:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  telemetry_blobs:
+  telemetry_cache:
