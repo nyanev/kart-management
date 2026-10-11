@@ -4,6 +4,7 @@
 # backend/, which submodule pinning would fight.
 /backend/
 /frontend/
+/mobile/
 
 # Real environment files never belong in git -- see .env.example for the
 # key names each service expects.

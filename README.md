@@ -10,10 +10,11 @@ kart-management/
 ├── docker-compose.prod.yml   production (the VPS runs this file)
 ├── .env.example              key names for both env files
 ├── backend/                  clone of kart-management-backend   (gitignored)
-└── frontend/                 clone of kart-management-frontend  (gitignored)
+├── frontend/                 clone of kart-management-frontend  (gitignored)
+└── mobile/                   clone of kart-management-mobile    (gitignored)
 ```
 
-The two application repos are plain clones rather than submodules: the deploy
+The application repos are plain clones rather than submodules: the deploy
 workflow does `git pull origin main` inside `backend/`, which submodule pinning
 would fight for no benefit at this scale.
 
@@ -24,6 +25,7 @@ git clone git@github.com:nyanev/kart-management.git
 cd kart-management
 git clone git@github.com:nyanev/kart-management-backend.git backend
 git clone git@github.com:nyanev/kart-management-frontend.git frontend
+git clone git@github.com:nyanev/kart-management-mobile.git mobile     # optional
 
 docker compose up -d --build
 ```
@@ -45,6 +47,21 @@ docker compose exec frontend pnpm type-check
 Telemetry jobs run **inline** when `TELEMETRY_REDIS_URL` is empty, which is why
 the test suite needs no broker. Development compose sets it, so dev uses the
 real worker.
+
+### Mobile app
+
+The Flutter client in `mobile/` is not part of compose; it runs against the
+API on host port 8001. The iOS simulator reaches it at `localhost`, the
+Android emulator at `10.0.2.2`, and a physical device needs the Mac's LAN IP:
+
+```bash
+cd mobile
+flutter run                                    # iOS simulator / Android emulator
+flutter run --dart-define=API_BASE_URL=http://192.168.x.y:8001/api   # device
+flutter analyze && flutter test
+```
+
+See `mobile/README.md` for details.
 
 ## Services
 
